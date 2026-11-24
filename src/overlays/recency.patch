@@ -1,0 +1,749 @@
+diff --git a/vllm/v1/attention/compression/compressor.py b/vllm/v1/attention/compression/compressor.py
+index 67e6dc084f..72147982d4 100644
+--- a/vllm/v1/attention/compression/compressor.py
++++ b/vllm/v1/attention/compression/compressor.py
+@@ -395,6 +395,39 @@ class KVCompressor:
+         self.req_state[req_id] = _RequestCompressState(row=row,
+                                                        score_store=store)
+ 
++    def resume_immutable_prefix(
++        self,
++        req_id: str,
++        kept_lengths: np.ndarray,
++    ) -> None:
++        """Seed Tangram's ratio lifecycle from a KVLadder prefix hit.
++
++        The shared compact prefix is already the result of a committed
++        compression boundary. Its exact physical length becomes the previous
++        kept length; no scorer state for the immutable prefix is recreated.
++        The scheduler protects that prefix as a sink and the executor skips its
++        block-aligned writeback, so only newly appended private KV is mutable.
++        """
++        if self.regime.name != "ratio":
++            raise RuntimeError(
++                "immutable-prefix resume supports Tangram's lock-in ratio "
++                "regime only; the budget regime globally reselects old slots"
++            )
++        lengths = np.asarray(kept_lengths, dtype=np.int32)
++        expected = (self.num_layers, self.num_head_groups_per_layer)
++        if lengths.shape != expected or np.any(lengths <= 0):
++            raise ValueError(
++                f"immutable prefix lengths {lengths.shape} do not match {expected}"
++            )
++        self.begin_request(req_id)
++        state = self.req_state[req_id]
++        state.has_committed = True
++        state.cached_kept_lengths_cpu = lengths.copy()
++        self.workspace.valid_lengths[state.row].copy_(
++            torch.from_numpy(lengths.astype(np.int64))
++        )
++        self.workspace.locked[state.row].zero_()
++
+     def end_request(self, req_id: str) -> None:
+         # Idempotent for worker shutdown paths. Releasing the row is what keeps
+         # the fixed row pool from leaking across a long-running engine.
+diff --git a/vllm/v1/attention/compression/executor.py b/vllm/v1/attention/compression/executor.py
+index 4f51e985cb..5b72858cb1 100644
+--- a/vllm/v1/attention/compression/executor.py
++++ b/vllm/v1/attention/compression/executor.py
+@@ -53,6 +53,7 @@ class CompressionMetadata:
+     row_idx: int
+     chunk_len: int
+     floor_min: int
++    immutable_prefix_tokens: int = 0
+ 
+ 
+ class CompressionExecutor:
+@@ -95,6 +96,10 @@ class CompressionExecutor:
+         # Reused arange slabs; sink/tail sizes are KeepDecision-uniform.
+         self._sink_idx_cache: torch.Tensor | None = None
+         self._tail_idx_cache: torch.Tensor | None = None
++        self.immutable_prefix_write_bytes: int = 0
++        self.protected_prefix_skip_bytes: int = 0
++        self.private_write_bytes: int = 0
++        self.ordinary_write_bytes: int = 0
+ 
+     def run_request(
+         self,
+@@ -261,6 +266,7 @@ class CompressionExecutor:
+                     tail_lo=tail_lo,
+                     kept_length=kept_length,
+                     device=device,
++                    immutable_prefix_tokens=metadata.immutable_prefix_tokens,
+                 )
+                 # Keep the regime's score memory slot-aligned with the KV it
+                 # just rewrote, using the very same positions: an evicted
+@@ -293,6 +299,7 @@ class CompressionExecutor:
+         tail_lo: int,
+         kept_length: int,
+         device: torch.device,
++        immutable_prefix_tokens: int = 0,
+     ) -> torch.Tensor:
+         """Evict one (layer, group): gather the kept KV positions, write back.
+ 
+@@ -351,30 +358,61 @@ class CompressionExecutor:
+             else torch.empty(
+                 page_group_size, 0, dtype=torch.long, device=device))
+ 
+-        keep_block = torch.div(keep_mat, block_size, rounding_mode="floor")
+-        keep_offset = keep_mat - keep_block * block_size
++        protected = int(immutable_prefix_tokens)
++        if protected:
++            if protected % block_size:
++                raise RuntimeError(
++                    "immutable KVLadder prefix must end on a physical block boundary"
++                )
++            if protected > kept_length:
++                raise RuntimeError("compression would truncate the immutable prefix")
++            expected = torch.arange(
++                protected, device=device, dtype=torch.long
++            ).unsqueeze(0).expand(page_group_size, -1)
++            if not torch.equal(keep_mat[:, :protected], expected):
++                raise RuntimeError(
++                    "Tangram keep plan would reselect the immutable prefix"
++                )
++
++        mutable_keep = keep_mat[:, protected:]
++        keep_block = torch.div(mutable_keep, block_size, rounding_mode="floor")
++        keep_offset = mutable_keep - keep_block * block_size
+         col_ix = torch.arange(
+             page_group_size, device=device, dtype=torch.long
+-        ).unsqueeze(1).expand_as(keep_mat)
++        ).unsqueeze(1).expand_as(mutable_keep)
+         # Advanced-index (block, offset, column) -> [2, page_group_size,
+         # kept_length, head_size].
+-        kept_kv = slab_view[
+-            :, keep_block, keep_offset, col_ix
+-        ].permute(0, 2, 1, 3).contiguous()
++        kept_kv = slab_view[:, keep_block, keep_offset, col_ix].permute(
++            0, 2, 1, 3
++        ).contiguous()
+ 
+         # Write back block-aligned; zero-pad the trailing partial block.
+-        n_blocks_write = (kept_length + block_size - 1) // block_size
++        mutable_length = kept_length - protected
++        n_blocks_write = (mutable_length + block_size - 1) // block_size
+         padded_size = n_blocks_write * block_size
+-        if kept_length < padded_size:
++        if mutable_length < padded_size:
+             pad = torch.zeros(
+-                2, padded_size - kept_length, page_group_size, head_size,
++                2, padded_size - mutable_length, page_group_size, head_size,
+                 dtype=kept_kv.dtype, device=device)
+             kept_kv = torch.cat([kept_kv, pad], dim=1)
+         # Inverse of the gather: token-major slab back to column-major
+         # [2, n_blocks_write, page_group_size, block_size, head_size].
+-        kv_cache[:, block_ids[:n_blocks_write]] = (
+-            kept_kv.view(
+-                2, n_blocks_write, block_size, page_group_size, head_size)
+-            .permute(0, 1, 3, 2, 4)
++        protected_blocks = protected // block_size
++        if n_blocks_write:
++            kv_cache[:, block_ids[
++                protected_blocks : protected_blocks + n_blocks_write
++            ]] = (
++                kept_kv.view(
++                    2, n_blocks_write, block_size, page_group_size, head_size)
++                .permute(0, 1, 3, 2, 4)
++            )
++        element_size = int(kv_cache.element_size())
++        self.protected_prefix_skip_bytes += (
++            2 * protected * page_group_size * head_size * element_size
+         )
++        write_bytes = int(kept_kv.numel() * element_size)
++        if protected:
++            self.private_write_bytes += write_bytes
++        else:
++            self.ordinary_write_bytes += write_bytes
+         return keep_mat
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 3d80c4a52a..609e4a3ee9 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -457,16 +457,36 @@ class BlockPool:
+                 block.ref_cnt += 1
+ 
+     def free_block_ids_array(self, ids: np.ndarray) -> None:
+-        """Ragged fast path: bulk-push int32 ids back into the ring
+-        buffer. Caller must guarantee ids are unique and exclude the null
+-        block (id 0); pushing the same id twice would corrupt
+-        ``num_free_blocks``.
+-        """
++        """Release one ragged owner for each physical id."""
++        self.release_block_ids_array(ids)
++
++    def retain_block_ids_array(self, ids: np.ndarray) -> None:
++        """Add one immutable/request owner without copying page payload."""
++        assert self.ragged
++        if ids.size == 0:
++            return
++        ids = ids.astype(np.int32, copy=False)
++        if np.unique(ids).size != ids.size or (ids <= 0).any():
++            raise ValueError("ragged retained ids must be unique and non-null")
++        if (self.ref_cnts[ids] <= 0).any():
++            raise RuntimeError("cannot retain a free ragged page")
++        if (self.ref_cnts[ids] == np.iinfo(self.ref_cnts.dtype).max).any():
++            raise RuntimeError("ragged page refcount overflow")
++        self.ref_cnts[ids] += 1
++
++    def release_block_ids_array(self, ids: np.ndarray) -> None:
++        """Drop one owner and recycle only ids whose refcount reaches zero."""
+         assert self.ragged
+         if ids.size == 0:
+             return
+-        self.ref_cnts[ids] = 0
+-        self._ring_append_ids(ids)
++        ids = ids.astype(np.int32, copy=False)
++        if np.unique(ids).size != ids.size or (ids <= 0).any():
++            raise ValueError("ragged released ids must be unique and non-null")
++        if (self.ref_cnts[ids] <= 0).any():
++            raise RuntimeError("ragged page refcount underflow")
++        self.ref_cnts[ids] -= 1
++        freed = ids[self.ref_cnts[ids] == 0]
++        self._ring_append_ids(freed)
+ 
+     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+         """Free a list of blocks. The blocks should be ordered by their
+@@ -496,9 +516,10 @@ class BlockPool:
+         )
+ 
+     def free_by_block_ids(self, block_ids: Iterable[int]) -> None:
+-        """Force-free physical block ids after compression resolved that no
+-        request still references them. Resets ``ref_cnt`` to 0 directly
+-        (not via ``free_blocks``) and returns them to the free pool.
++        """Release physical block ids after compression drops request ownership.
++
++        An immutable ragged prefix may still own an id, in which case it stays
++        live and is not returned to the free ring.
+         """
+         if self.ragged:
+             if isinstance(block_ids, np.ndarray):
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 441dae1665..c3b62bc726 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -205,6 +205,25 @@ class KVCacheManager:
+             m.ragged
+             for m in self.coordinator.single_type_managers
+         )
++        self.ragged_block_size = 0
++        self.ragged_physical_block_bytes = 0
++        if self.ragged:
++            ragged_managers = [
++                manager
++                for manager in self.coordinator.single_type_managers
++                if manager.ragged
++            ]
++            if len(ragged_managers) != 1:
++                raise RuntimeError(
++                    "KVLadder P2 requires one Tangram ragged cache manager"
++                )
++            self.ragged_block_size = int(ragged_managers[0].block_size)
++            total_bytes = sum(
++                int(tensor.size) for tensor in kv_cache_config.kv_cache_tensors
++            )
++            self.ragged_physical_block_bytes = (
++                total_bytes // int(kv_cache_config.num_blocks)
++            )
+ 
+         # Pre-constructed empty KVCacheBlocks reused across callers to avoid
+         # GC overhead. In ragged mode mirror the ndarray fast path so
+@@ -494,6 +513,37 @@ class KVCacheManager:
+         """
+         self.coordinator.free(request.request_id)
+ 
++    def _ragged_manager(self):
++        managers = [
++            manager
++            for manager in self.coordinator.single_type_managers
++            if manager.ragged
++        ]
++        if len(managers) != 1:
++            raise RuntimeError("expected exactly one ragged manager")
++        return managers[0]
++
++    def attach_ragged_prefix_block_ids(
++        self, request_id: str, block_ids: Sequence[int]
++    ) -> None:
++        ids = np.asarray(tuple(block_ids), dtype=np.int32)
++        self._ragged_manager().attach_shared_block_ids(request_id, ids)
++
++    def detach_ragged_prefix_block_ids(self, request_id: str) -> None:
++        self._ragged_manager().free(request_id)
++
++    def retain_ragged_prefix_block_ids(self, block_ids: Sequence[int]) -> None:
++        ids = np.asarray(tuple(block_ids), dtype=np.int32)
++        self.block_pool.retain_block_ids_array(ids)
++
++    def release_ragged_prefix_block_ids(self, block_ids: Sequence[int]) -> None:
++        ids = np.asarray(tuple(block_ids), dtype=np.int32)
++        self.block_pool.release_block_ids_array(ids)
++
++    def ragged_prefix_refcounts(self, block_ids: Sequence[int]) -> tuple[int, ...]:
++        ids = np.asarray(tuple(block_ids), dtype=np.int32)
++        return tuple(int(value) for value in self.block_pool.ref_cnts[ids])
++
+     def free_blocks_by_ids(
+         self,
+         block_ids: "set[int] | np.ndarray",
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 0b05444011..df1a3c9475 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -46,6 +46,8 @@ class NewRequestData:
+ 
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
++    # Optional KVLadder immutable ragged-prefix restore/capture contract.
++    kvladder_ragged_prefix_metadata: dict[str, object] | None = None
+ 
+     @classmethod
+     def from_request(
+@@ -65,6 +67,9 @@ class NewRequestData:
+             lora_request=request.lora_request,
+             prompt_embeds=request.prompt_embeds,
+             prefill_token_ids=prefill_token_ids,
++            kvladder_ragged_prefix_metadata=getattr(
++                request, "kvladder_ragged_prefix_metadata", None
++            ),
+         )
+ 
+     def __repr__(self) -> str:
+@@ -201,6 +206,11 @@ class CompressionRequestMetadata:
+     # Budget regime only: whether the fresh chunk is an eviction candidate
+     # (``CacheConfig.compression_evict_current_chunk``).
+     evict_current_chunk: bool = False
++    # KVLadder continuation-only compression. The immutable compact prefix is
++    # block aligned and protected from executor writeback; only tokens appended
++    # after it participate in Tangram's existing ratio lifecycle.
++    immutable_prefix_tokens: int = 0
++    private_continuation: bool = False
+ 
+ 
+ @bc_linter_include
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 61d31ee70c..a438685f01 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -189,6 +189,10 @@ class Scheduler(SchedulerInterface):
+             pcp_world_size=self.pcp_world_size,
+             watermark=self.scheduler_config.watermark,
+         )
++        # Optional KVLadder P2 integration. Tangram remains the allocator,
++        # scheduler, and native ragged-attention data plane; the injected
++        # registry only supplies representation-aware lookup and ownership.
++        self.kvladder_ragged_prefix_cache: Any | None = None
+         # Admission control: gate new requests on the full input sequence
+         # fitting in the KV cache (not just the first chunk), to prevent
+         # over-admission and preemption thrashing under chunked prefill.
+@@ -377,6 +381,10 @@ class Scheduler(SchedulerInterface):
+                         preempted_req = self.running.pop()
+ 
+                     self.kv_cache_manager.free(preempted_req)
++                    if self.kvladder_ragged_prefix_cache is not None:
++                        self.kvladder_ragged_prefix_cache.on_request_preempted(
++                            preempted_req
++                        )
+                     self.encoder_cache_manager.free(preempted_req)
+                     preempted_req.status = RequestStatus.PREEMPTED
+                     preempted_req.num_computed_tokens = 0
+@@ -814,6 +822,11 @@ class Scheduler(SchedulerInterface):
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
+ 
++        if self.kvladder_ragged_prefix_cache is not None:
++            self.kvladder_ragged_prefix_cache.on_schedule_output(
++                scheduler_output
++            )
++
+         return scheduler_output
+ 
+     def _maybe_add_compression_metadata(
+@@ -825,9 +838,9 @@ class Scheduler(SchedulerInterface):
+         """Add a ``CompressionRequestMetadata`` entry when compression is
+         enabled and this step advances prefill.
+ 
+-        Once-only policy: compression fires only over the first prefill
+-        cycle; ``compression_done`` (set sticky in ``update_from_output``)
+-        gates every subsequent step.
++        Ordinary requests use the once-only first-prefill policy. KVLadder
++        prefix hits instead mark the shared compressed representation ready and
++        run this same lifecycle over only the private continuation.
+ 
+         ``chunk_in_sequence_idx`` is a first-prefill-chunk flag: the worker
+         resets a request's per-request compression state (and zeroes its
+@@ -850,9 +863,28 @@ class Scheduler(SchedulerInterface):
+         # Decode chunk (prefill already finished): no compression.
+         if request.num_computed_tokens >= request.num_prompt_tokens:
+             return
+-        # First-prefill-chunk flag (see docstring): 0 only on the genuine first
+-        # chunk, nonzero otherwise. Deliberately not a chunk-index division.
+-        chunk_in_seq_idx = 0 if request.num_computed_tokens == 0 else 1
++        private_continuation = bool(request.kvladder_shared_prefix_ready)
++        immutable_prefix_tokens = (
++            int(request.kvladder_immutable_prefix_tokens)
++            if private_continuation else 0
++        )
++        logical_prefix_tokens = (
++            int(request.kvladder_logical_shared_prefix_tokens)
++            if private_continuation else 0
++        )
++        if private_continuation:
++            if request.kvladder_private_compression_state != "pending":
++                return
++            if immutable_prefix_tokens <= 0 or logical_prefix_tokens <= 0:
++                raise RuntimeError(
++                    "KVLadder private compression lacks an immutable prefix boundary"
++                )
++        # A restored KVLadder row is not a fresh worker row: chunk index 1
++        # prevents the ordinary reset from zeroing its effective lengths.
++        chunk_in_seq_idx = (
++            1 if private_continuation
++            else (0 if request.num_computed_tokens == 0 else 1)
++        )
+         end = request.num_computed_tokens + num_new_tokens
+         is_last_chunk = end >= request.num_prompt_tokens
+         # Eviction runs only when this step closes a full chunk_size boundary
+@@ -864,28 +896,39 @@ class Scheduler(SchedulerInterface):
+         # last chunk. This makes every eviction a full-chunk_size chunk,
+         # matching the serial baseline's chunk sequence exactly.
+         chunk_size = int(self.cache_config.compression_chunk_size or 0)
++        boundary_end = end - logical_prefix_tokens if private_continuation else end
++        if boundary_end <= 0:
++            raise RuntimeError("private compression did not advance past its prefix")
+         if chunk_size > 0:
+-            run_compression = (end % chunk_size == 0) or is_last_chunk
+-            last_boundary = ((end - 1) // chunk_size) * chunk_size
+-            compression_chunk_len = end - last_boundary
++            run_compression = (boundary_end % chunk_size == 0) or is_last_chunk
++            last_boundary = ((boundary_end - 1) // chunk_size) * chunk_size
++            compression_chunk_len = boundary_end - last_boundary
+         else:
+             run_compression = True
+             compression_chunk_len = int(num_new_tokens)
++        total_prompt_tokens = int(request.num_prompt_tokens)
++        n_sink_tokens = int(self.cache_config.compression_n_sink_tokens or 0)
++        if private_continuation:
++            private_prompt_tokens = request.num_prompt_tokens - logical_prefix_tokens
++            total_prompt_tokens = immutable_prefix_tokens + private_prompt_tokens
++            n_sink_tokens = immutable_prefix_tokens
+         compression_metadata[request.request_id] = CompressionRequestMetadata(
+             req_id=request.request_id,
+             compression_keep_ratio=float(
+                 self.cache_config.compression_keep_ratio),
+             window_size=int(self.cache_config.compression_window_size or 0),
+-            n_sink_tokens=int(self.cache_config.compression_n_sink_tokens or 0),
++            n_sink_tokens=n_sink_tokens,
+             floor_min=int(self.cache_config.compression_floor_min or 0),
+             chunk_in_sequence_idx=int(chunk_in_seq_idx),
+             is_last_chunk=bool(is_last_chunk),
+             run_compression=bool(run_compression),
+             compression_chunk_len=int(compression_chunk_len),
+-            total_prompt_tokens=int(request.num_prompt_tokens),
++            total_prompt_tokens=total_prompt_tokens,
+             budget_tokens=self.cache_config.compression_budget_tokens,
+             evict_current_chunk=bool(
+                 self.cache_config.compression_evict_current_chunk),
++            immutable_prefix_tokens=immutable_prefix_tokens,
++            private_continuation=private_continuation,
+         )
+ 
+     def _update_after_schedule(
+@@ -1204,6 +1247,8 @@ class Scheduler(SchedulerInterface):
+                 cm = scheduler_output.compression_metadata.get(req_id)
+                 if cm is not None and cm.is_last_chunk:
+                     request.compression_done = True
++                    if cm.private_continuation:
++                        request.kvladder_private_compression_state = "done"
+         # Both freed-block channels below come only from requests that ran a
+         # compression step this iteration, and ``compression_new_eff_seq_lens``
+         # is keyed by exactly those requests — a complete superset of both
+@@ -1250,6 +1295,18 @@ class Scheduler(SchedulerInterface):
+                         and request.compress_max_eff_seq_len is not None):
+                     request.compress_max_eff_seq_len += num_tokens
+ 
++        ragged_prefix_snapshots = model_runner_output.ragged_prefix_snapshots
++        if (
++            self.kvladder_ragged_prefix_cache is not None
++            and ragged_prefix_snapshots
++        ):
++            for req_id, snapshot in ragged_prefix_snapshots.items():
++                request = self.requests.get(req_id)
++                if request is not None:
++                    self.kvladder_ragged_prefix_cache.on_model_output(
++                        request, snapshot
++                    )
++
+         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
+         # the below loop can be a performance bottleneck. We should do our best
+         # to avoid expensive operations inside the loop.
+@@ -1515,8 +1572,18 @@ class Scheduler(SchedulerInterface):
+         return len(self.running), len(self.waiting)
+ 
+     def add_request(self, request: Request) -> None:
+-        self.waiting.add_request(request)
+-        self.requests[request.request_id] = request
++        try:
++            if self.kvladder_ragged_prefix_cache is not None:
++                self.kvladder_ragged_prefix_cache.on_request_arrival(request)
++            self.waiting.add_request(request)
++            self.requests[request.request_id] = request
++        except BaseException:
++            if self.kvladder_ragged_prefix_cache is not None:
++                self.kv_cache_manager.free(request)
++                self.kvladder_ragged_prefix_cache.on_request_finished(
++                    request, reason="arrival_failed"
++                )
++            raise
+         if self.log_stats:
+             request.record_event(EngineCoreEventType.QUEUED)
+ 
+@@ -1581,8 +1648,25 @@ class Scheduler(SchedulerInterface):
+ 
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+-        self.kv_cache_manager.free(request)
+-        del self.requests[request.request_id]
++        try:
++            if self.kvladder_ragged_prefix_cache is not None:
++                self.kvladder_ragged_prefix_cache.prepare_request_finish(request)
++        finally:
++            # A rejected/misaligned commit must fail closed without leaking the
++            # request's base alias or private pages.
++            self.kv_cache_manager.free(request)
++            if self.kvladder_ragged_prefix_cache is not None:
++                self.kvladder_ragged_prefix_cache.on_request_finished(
++                    request, reason=f"finish:{request.status.name}"
++                )
++            del self.requests[request.request_id]
++
++    def set_kvladder_ragged_prefix_cache(self, cache: Any | None) -> None:
++        """Install the narrow representation-aware ragged prefix registry."""
++
++        self.kvladder_ragged_prefix_cache = cache
++        if cache is not None:
++            cache.bind_kv_cache_manager(self.kv_cache_manager)
+ 
+     def get_num_unfinished_requests(self) -> int:
+         return len(self.waiting) + len(self.running)
+@@ -1629,6 +1713,8 @@ class Scheduler(SchedulerInterface):
+         return spec_decoding_stats
+ 
+     def shutdown(self) -> None:
++        if self.kvladder_ragged_prefix_cache is not None:
++            self.kvladder_ragged_prefix_cache.drain()
+         if self.kv_event_publisher:
+             self.kv_event_publisher.shutdown()
+         if self.connector is not None:
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index bdb69f4dde..868c4ce0a2 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -277,6 +277,19 @@ class SingleTypeKVCacheManager(ABC):
+             return np.empty(0, dtype=np.int32)
+         return ids
+ 
++    def attach_shared_block_ids(
++        self, request_id: str, block_ids: np.ndarray
++    ) -> None:
++        """Install an immutable ragged prefix as one request owner."""
++        if not self.ragged:
++            raise RuntimeError("shared raw ids require ragged paging")
++        if request_id in self.req_to_block_ids:
++            raise RuntimeError("request already has ragged page ownership")
++        ids = block_ids.astype(np.int32, copy=True)
++        self.block_pool.retain_block_ids_array(ids)
++        self.req_to_block_ids[request_id] = ids
++        self.num_cached_block[request_id] = int(ids.size)
++
+     def free(self, request_id: str) -> None:
+         """
+         Free the blocks for the request.
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 7dad47de97..01728acbe4 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -193,6 +193,8 @@ class ModelRunnerOutput:
+     (out-of-window front blocks of sliding-window layers). Routed through
+     ``KVCacheManager.null_blocks_by_ids`` — null-in-place (length-preserving),
+     NOT the shrinking ``free_blocks_by_ids`` used for compression."""
++    ragged_prefix_snapshots: dict[str, dict[str, object]] | None = None
++    """Managed request -> native 3-D ragged block table and row lengths."""
+ 
+ 
+ # ModelRunnerOutput wrapper for async scheduling.
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 7d0aa42a4d..3639dcb404 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -154,10 +154,13 @@ class Request:
+         # size ``allocate_slots``. ``None`` for non-compression requests.
+         self.compress_max_eff_seq_len: int | None = None
+ 
+-        # Once-only compression: True (sticky) once the initial prefill
+-        # cycle finishes; the scheduler then stops emitting compression
+-        # metadata for this request.
++        # Compression state for ordinary requests. KVLadder prefix hits split
++        # this from the already-ready immutable shared representation below.
+         self.compression_done: bool = False
++        self.kvladder_shared_prefix_ready: bool = False
++        self.kvladder_private_compression_state: str = "not_applicable"
++        self.kvladder_immutable_prefix_tokens: int = 0
++        self.kvladder_logical_shared_prefix_tokens: int = 0
+ 
+         # Multi-turn auto-advance. When ``multi_turn_token_ids`` is set,
+         # it carries the per-turn user-input tokens for the whole
+diff --git a/vllm/v1/worker/compression_model_runner_mixin.py b/vllm/v1/worker/compression_model_runner_mixin.py
+index 1d3cc25386..321b742081 100644
+--- a/vllm/v1/worker/compression_model_runner_mixin.py
++++ b/vllm/v1/worker/compression_model_runner_mixin.py
+@@ -314,9 +314,25 @@ class CompressionModelRunnerMixin:
+ 
+         # First-chunk resets happen earlier in
+         # ``_pre_prepare_compression_reset``; this only adds fresh state.
+-        for req_id in compression_metadata:
++        for req_id, metadata in compression_metadata.items():
+             if req_id not in self.compressor.req_state:
+-                self.compressor.begin_request(req_id)
++                if metadata.private_continuation:
++                    immutable = int(metadata.immutable_prefix_tokens)
++                    if immutable <= 0:
++                        raise RuntimeError(
++                            "private continuation lacks immutable prefix length"
++                        )
++                    kept = np.full(
++                        (
++                            len(self.compression_static_layer_ids),
++                            self.compression_executor.num_head_groups_per_layer,
++                        ),
++                        immutable,
++                        dtype=np.int32,
++                    )
++                    self.compressor.resume_immutable_prefix(req_id, kept)
++                else:
++                    self.compressor.begin_request(req_id)
+ 
+         self.compressor.compress_active = True
+         self.compressor.pending_req_offsets = offsets
+@@ -485,6 +501,7 @@ class CompressionModelRunnerMixin:
+                 row_idx=row_idx,
+                 chunk_len=chunk_len,
+                 floor_min=req_md.floor_min,
++                immutable_prefix_tokens=req_md.immutable_prefix_tokens,
+             )
+ 
+             # The compressor scores/evicts only the compressible layers, so it
+@@ -681,4 +698,3 @@ class CompressionModelRunnerMixin:
+             tokens_per_row[row] = num_tokens
+             any_active = True
+         return tokens_per_row if any_active else None
+-
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 1065a7e243..95f54e4091 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -63,6 +63,10 @@ class CachedRequestState:
+     # Ragged paging: this step's newly allocated block ids for a
+     # request being re-added, appended after ``restore_row``.
+     block_table_readd_increment: tuple[list[int], ...] | None = None
++    # KVLadder: one-shot publish/diagnostic capture. Prefix-hit decode uses the
++    # stable descriptor id plus scheduler block deltas instead of snapshots.
++    kvladder_ragged_prefix_capture: bool = False
++    kvladder_ragged_prefix_descriptor_id: str | None = None
+ 
+     def __post_init__(self):
+         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index bd6b25f1ed..0cc4f087e0 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -830,6 +830,41 @@ class GPUModelRunner(
+                 output_token_ids=[],
+                 lora_request=new_req_data.lora_request,
+             )
++            ragged_prefix = new_req_data.kvladder_ragged_prefix_metadata
++            if ragged_prefix is not None:
++                req_state.kvladder_ragged_prefix_capture = bool(
++                    ragged_prefix.get("capture", False)
++                )
++                descriptor_id = ragged_prefix.get("descriptor_id")
++                req_state.kvladder_ragged_prefix_descriptor_id = (
++                    None if descriptor_id is None else str(descriptor_id)
++                )
++                restore = ragged_prefix.get("restore")
++                if restore is not None:
++                    if not isinstance(restore, dict):
++                        raise RuntimeError(
++                            "KVLadder ragged-prefix restore must be a mapping"
++                        )
++                    base_ids = [int(value) for value in restore["base_block_ids"]]
++                    if len(req_state.block_ids) != 1:
++                        raise RuntimeError(
++                            "KVLadder ragged-prefix restore requires one KV group"
++                        )
++                    request_ids = req_state.block_ids[0]
++                    if request_ids[: len(base_ids)] != base_ids:
++                        raise RuntimeError(
++                            "scheduler raw page ownership disagrees with worker restore"
++                        )
++                    req_state.block_table_snapshot = (
++                        np.asarray(restore["block_table"], dtype=np.int32),
++                        np.asarray(restore["block_counts"], dtype=np.int32),
++                    )
++                    req_state.eff_seq_lens_snapshot = np.asarray(
++                        restore["effective_seq_lens"], dtype=np.int32
++                    )
++                    req_state.block_table_readd_increment = (
++                        request_ids[len(base_ids) :],
++                    )
+             self.requests[req_id] = req_state
+ 
+             if sampling_params and sampling_params.prompt_logprobs is not None:
+@@ -3236,6 +3271,39 @@ class GPUModelRunner(
+             if self.last_sliding_freed_block_ids.size
+             else None
+         )
++        ragged_prefix_snapshots: dict[str, dict[str, object]] = {}
++        if self.input_batch.ragged:
++            effective = self.input_batch.effective_seq_lens_cpu
++            assert effective is not None
++            table = self.input_batch.block_table.block_tables[0]
++            publish_ids = {
++                req_id
++                for req_id, metadata in scheduler_output.compression_metadata.items()
++                if metadata.is_last_chunk
++                and req_id in (compression_new_eff_seq_lens_payload or {})
++            }
++            for req_id, req_state in self.requests.items():
++                if not req_state.kvladder_ragged_prefix_capture:
++                    continue
++                # The miss path needs one exact native snapshot only after the
++                # compressor publishes its final retained layout. Prefix-hit
++                # requests carry capture=False and evolve through scheduler
++                # deltas, so decode never serializes the full 3-D table.
++                if req_id not in publish_ids:
++                    continue
++                row = self.input_batch.req_id_to_index.get(req_id)
++                if row is None:
++                    continue
++                block_ids, counts = table.snapshot_row(row)
++                ragged_prefix_snapshots[req_id] = {
++                    "block_table": block_ids.tolist(),
++                    "block_counts": counts.tolist(),
++                    "effective_seq_lens": effective[row, :].tolist(),
++                    "descriptor_id": (
++                        req_state.kvladder_ragged_prefix_descriptor_id
++                    ),
++                }
++                req_state.kvladder_ragged_prefix_capture = False
+ 
+         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+             output = ModelRunnerOutput(
+@@ -3253,6 +3321,7 @@ class GPUModelRunner(
+                 compression_new_eff_seq_lens=compression_new_eff_seq_lens_payload,
+                 compression_freed_block_ids=compression_freed_block_ids_payload,
+                 sliding_freed_block_ids=sliding_freed_block_ids_payload,
++                ragged_prefix_snapshots=ragged_prefix_snapshots or None,
+             )
+ 
+         if not self.use_async_scheduling:

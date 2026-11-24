@@ -1,0 +1,20 @@
+{
+  "label": "PASS_E3_PRIME_LENGTH_RAGGED_DIRECT_SHARING",
+  "conditions": {
+    "C10_one_fingerprint_one_length_vector": true,
+    "C11_quality_config_contract_identical": true,
+    "C12_tail_fill_rule_identical_across_arms": true,
+    "C1_all_bases_length_ragged": true,
+    "C2_same_representation_per_pair": true,
+    "C3p_refcount_equals_registry_plus_attached_unreleased": true,
+    "C4_frozen_duplicates_shared_aliases": true,
+    "C5_zero_immutable_rewrite": true,
+    "C6_no_underflow_hidden_refusal_leak": true,
+    "C7_all_requests_complete": true,
+    "C8_allocator_and_gpu_drain": true,
+    "C9pA_matched_concurrency_memory_advantage": true
+  },
+  "expected_runs": 36,
+  "runs": 36,
+  "source_sha256": "427e9d1fde4a0193a67c4f1f51e2c82822a89f9692a8d7fa1134ecd9d6eeda7d"
+}

@@ -1,0 +1,18 @@
+{
+  "label": "FAIL_E3_SHARING_CONDITION_3_9",
+  "conditions": {
+    "1_all_bases_length_ragged": true,
+    "2_same_representation_per_seed": true,
+    "3_shared_aliases_one_base": false,
+    "4_frozen_duplicates_base": true,
+    "5_zero_immutable_rewrite": true,
+    "6_no_ownership_underflow_leak": true,
+    "7_complete_drain": true,
+    "8_all_requests_complete": true,
+    "9_shared_less_peak_hbm_at_b_gt_1": false,
+    "slack_never_negative": true
+  },
+  "expected_runs": 36,
+  "runs": 36,
+  "source_sha256": "6d5b8d67a54cc7533ed8b9e37d1cdb9bad5b7f05c387aace0582e69eeba0ec12"
+}
