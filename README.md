@@ -39,7 +39,7 @@ PYTHONPATH=src python -m pytest -q reproduction/checks
 | [scripts/](scripts/) | Trace builder, GPU campaign runners, quality and lifecycle checks, and CPU analysis and plotting. |
 | [reproduction/REPRODUCTION.md](reproduction/REPRODUCTION.md) | GPU setup, commands, source fingerprints, data provenance and comparison boundaries. |
 | [reproduction/data/](reproduction/data/) | Per-run burst measurements, paired QA scores and the length-ragged study's initial and replication verdicts. |
-| [paper/](paper/) | Reserved for the forthcoming paper PDF at `paper/KVLadder_PDCAT2026.pdf` and optional poster material. |
+| [paper/](paper/) | [Download the PDCAT 2026 paper (PDF)](paper/KVLadder_PDCAT2026.pdf). |
 
 The native-recency, matched-recency and content-gated experiments used distinct protocols. In the content-gated replication, **36 is both the number of runs and the number of distinct retained lengths**. Each base had **64 rows**. The 24 GiB runs compare memory at equal concurrency. The 8 GiB runs compare how many requests fit under the same budget. The quality study measures complete documents separately.
 
